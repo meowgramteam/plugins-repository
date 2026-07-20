@@ -1,0 +1,77 @@
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class
+from java.lang import Boolean
+
+__id__ = "hide_ai_button"
+__name__ = "Hide AI Button"
+__description__ = "Hides the AI editor button and hint while typing."
+__author__ = "@kvucoplugins"
+__version__ = "1.0"
+__icon__ = "trychatgpt_ru/62"
+__app_version__ = ">=12.5.1"
+
+TARGET_METHOD = "showAiButton"
+TARGET_CLASSES = (
+    "org.telegram.ui.Components.ChatActivityEnterView",
+    "org.telegram.ui.Components.ChatAttachAlert",
+    "org.telegram.ui.Components.CaptionPhotoViewer",
+)
+
+
+class HideAiButtonHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            if param.args:
+                param.args[0] = Boolean(False)
+        except Exception as exc:
+            self.plugin.log_once("before_show_ai", f"showAiButton hook failed: {exc}")
+
+
+class HideAiButtonPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.unhook_objects = []
+        self.logged_messages = set()
+
+    def on_plugin_load(self):
+        self.on_plugin_unload()
+
+        for class_name in TARGET_CLASSES:
+            try:
+                clazz = find_class(class_name)
+                if clazz is None:
+                    self.log_once(f"missing_class_{class_name}", f"Class not found: {class_name}")
+                    continue
+
+                unhooks = self.hook_all_methods(
+                    clazz,
+                    TARGET_METHOD,
+                    HideAiButtonHook(self),
+                    priority=10000,
+                )
+                if unhooks:
+                    self.unhook_objects.extend(unhooks)
+                else:
+                    self.log_once(
+                        f"missing_method_{class_name}",
+                        f"Method not hooked: {class_name}.{TARGET_METHOD}",
+                    )
+            except Exception as exc:
+                self.log_once(f"hook_setup_{class_name}", f"Hook setup failed for {class_name}: {exc}")
+
+    def on_plugin_unload(self):
+        for unhook in list(getattr(self, "unhook_objects", [])):
+            try:
+                self.unhook_method(unhook)
+            except Exception:
+                pass
+        self.unhook_objects.clear()
+
+    def log_once(self, key, message):
+        if key in self.logged_messages:
+            return
+        self.logged_messages.add(key)
+        self.log(message)
