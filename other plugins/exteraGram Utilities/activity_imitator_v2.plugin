@@ -1,0 +1,314 @@
+# -*- coding: utf-8 -*-
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
+from client_utils import send_request, get_messages_controller, get_last_fragment
+from android_utils import log, run_on_ui_thread
+from ui.alert import AlertDialogBuilder
+from ui.settings import Header, Selector
+from ui.bulletin import BulletinHelper
+from org.telegram.tgnet import TLRPC
+from typing import Dict, Any, List, Optional
+import threading
+import time
+import random
+
+__id__ = "activity_imitator_v2"
+__name__ = "Activity Control"
+__description__ = "Имитирует активность с выбором времени, случайным режимом и поддержкой нескольких языков. | Imitates activity with time selection, random mode, and multi-language support."
+__author__ = "@Skorvash"
+__version__ = "1.5.2"
+__min_version__ = "11.12.0"
+
+# Словарь переводов для многоязычного интерфейса
+STRINGS = {
+    "en": {
+        "MENU_ITEM": "Activity Imitation",
+        "SETTINGS_TITLE": "Imitation Settings",
+        "LANG_LABEL": "Language",
+        "WHAT_TO_DO": "What to imitate?",
+        "FOR_HOW_LONG": "For how long?",
+        "RANDOM": "Random activity 🎲",
+        "STOP_ALL": "Stop everything",
+        "INFINITE": "Infinite",
+        "SEC": "sec",
+        "MINUTES": "min",
+        "STARTED": "Imitation started",
+        "STOPPED": "Imitation stopped",
+        "FINISHED": "Imitation finished",
+        "ACTIONS": ["Typing...", "Recording audio...", "Recording video...", "Uploading photo...", "Uploading video...", "Playing game...", "Choosing contact...", "Geolocation...", "Document..."]
+    },
+    "ru": {
+        "MENU_ITEM": "Имитация активности",
+        "SETTINGS_TITLE": "Настройки имитации",
+        "LANG_LABEL": "Язык (Language)",
+        "WHAT_TO_DO": "Что имитируем?",
+        "FOR_HOW_LONG": "На какое время?",
+        "RANDOM": "Случайная активность 🎲",
+        "STOP_ALL": "Остановить всё",
+        "INFINITE": "Бесконечно",
+        "SEC": "сек",
+        "MINUTES": "мин",
+        "STARTED": "Имитация запущена",
+        "STOPPED": "Имитация остановлена",
+        "FINISHED": "Имитация завершена",
+        "ACTIONS": ["Печатает...", "Записывает голосовое...", "Записывает видео...", "Отправляет фото...", "Отправляет видео...", "Играет...", "Выбирает контакт...", "Геопозиция...", "Документ..."]
+    },
+    "fr": {
+        "MENU_ITEM": "Imitation d'activité",
+        "SETTINGS_TITLE": "Paramètres d'imitation",
+        "LANG_LABEL": "Langue",
+        "WHAT_TO_DO": "Que simuler ?",
+        "FOR_HOW_LONG": "Combien de temps ?",
+        "RANDOM": "Activité aléatoire 🎲",
+        "STOP_ALL": "Tout arrêter",
+        "INFINITE": "Infini",
+        "SEC": "sec",
+        "MINUTES": "min",
+        "STARTED": "Imitation démarrée",
+        "STOPPED": "Imitation arrêtée",
+        "FINISHED": "Imitation terminée",
+        "ACTIONS": ["Écrit...", "Enregistre un audio...", "Enregistre une vidéo...", "Envoie une photo...", "Envoie une vidéo...", "Joue...", "Choisit un contact...", "Géolocalisation...", "Document..."]
+    },
+    "ar": {
+        "MENU_ITEM": "محاكاة النشاط",
+        "SETTINGS_TITLE": "إعدادات المحاكاة",
+        "LANG_LABEL": "اللغة",
+        "WHAT_TO_DO": "ماذا نحاكي؟",
+        "FOR_HOW_LONG": "كم من الوقت؟",
+        "RANDOM": "نشاط عشوائي 🎲",
+        "STOP_ALL": "إيقاف الكل",
+        "INFINITE": "غير محدود",
+        "SEC": "ثانية",
+        "MINUTES": "دقيقة",
+        "STARTED": "بدأت المحاكاة",
+        "STOPPED": "توقفت المحاكاة",
+        "FINISHED": "انتهت المحاكاة",
+        "ACTIONS": ["يكتب...", "يسجل صوتاً...", "يسجل فيديو...", "يرسل صورة...", "يرسل فيديو...", "يلعب...", "يختار جهة اتصال...", "موقع جغرافي...", "مستند..."]
+    },
+    "he": {
+        "MENU_ITEM": "חיקוי פעילות",
+        "SETTINGS_TITLE": "הגדרות חיקוי",
+        "LANG_LABEL": "שפה",
+        "WHAT_TO_DO": "מה לחקות?",
+        "FOR_HOW_LONG": "לכמה זמן?",
+        "RANDOM": "פעילות אקראית 🎲",
+        "STOP_ALL": "עצור הכל",
+        "INFINITE": "ללא הגבלה",
+        "SEC": "שנ'",
+        "MINUTES": "דק'",
+        "STARTED": "החיקוי הופעל",
+        "STOPPED": "החיקוי הופסק",
+        "FINISHED": "החיקוי הסתיים",
+        "ACTIONS": ["מקליד...", "מקליט שמע...", "מקליט וידאו...", "מעלה תמונה...", "מעלה וידאו...", "משחק...", "בוחר איש קשר...", "מיקום...", "מסמך..."]
+    }
+}
+
+class ActivityControlPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._active_loops = {} # Словарь активных циклов для каждого чата
+        self._lock = threading.Lock()
+        self._langs = ["en", "ru", "fr", "ar", "he"]
+
+    def _get_str(self, key: str) -> Any:
+        """Получает строку на выбранном языке из настроек."""
+        try:
+            # Принудительно приводим к int, так как настройки могут вернуться строкой
+            lang_idx = int(self.get_setting("lang_idx", 1))
+        except (ValueError, TypeError):
+            lang_idx = 1
+            
+        if lang_idx >= len(self._langs) or lang_idx < 0:
+            lang_idx = 0
+            
+        lang_code = self._langs[lang_idx]
+        return STRINGS.get(lang_code, STRINGS["en"]).get(key, key)
+
+    def on_plugin_load(self):
+        # Инициализация пункта меню при загрузке
+        self.update_menu()
+
+    def update_menu(self):
+        """Обновляет пункт меню в три-дот меню чата."""
+        self.remove_menu_item("imitator_menu_action")
+        self.add_menu_item(
+            MenuItemData(
+                menu_type=MenuItemType.CHAT_ACTION_MENU,
+                text=self._get_str("MENU_ITEM"),
+                on_click=self.show_action_menu,
+                icon="msg_edit",
+                item_id="imitator_menu_action"
+            )
+        )
+
+    def _on_lang_change(self, new_idx: int):
+        """Вызывается при смене языка пользователем."""
+        self.set_setting("lang_idx", int(new_idx))
+        self.update_menu()
+
+    def create_settings(self) -> List[Any]:
+        # Генерация экрана настроек
+        return [
+            Header(text=self._get_str("SETTINGS_TITLE")),
+            Selector(
+                key="lang_idx",
+                text=self._get_str("LANG_LABEL"),
+                items=["English", "Русский", "Français", "العربية", "עברית"],
+                default=1,
+                on_change=self._on_lang_change
+            )
+        ]
+
+    def show_action_menu(self, context: Dict[str, Any]):
+        """Отображает диалог выбора типа активности."""
+        fragment = context.get("fragment") or get_last_fragment()
+        activity = fragment.getParentActivity() if fragment else None
+        dialog_id = context.get("dialog_id")
+
+        if not activity or not dialog_id:
+            return
+
+        actions_list = self._get_str("ACTIONS")
+        tl_actions = [
+            TLRPC.TL_sendMessageTypingAction(),
+            TLRPC.TL_sendMessageRecordAudioAction(),
+            TLRPC.TL_sendMessageRecordVideoAction(),
+            TLRPC.TL_sendMessageUploadPhotoAction(),
+            TLRPC.TL_sendMessageUploadVideoAction(),
+            TLRPC.TL_sendMessageGamePlayAction(),
+            TLRPC.TL_sendMessageChooseContactAction(),
+            TLRPC.TL_sendMessageGeoLocationAction(),
+            TLRPC.TL_sendMessageUploadDocumentAction()
+        ]
+
+        # Подготовка списка элементов диалога
+        menu_items = []
+        for i in range(len(actions_list)):
+            menu_items.append((actions_list[i], tl_actions[i]))
+        
+        menu_items.append((self._get_str("RANDOM"), "RANDOM"))
+        menu_items.append((self._get_str("STOP_ALL"), "STOP"))
+
+        def on_action_chosen(bld, index):
+            bld.dismiss()
+            if index < 0 or index >= len(menu_items): return
+            
+            label, action_obj = menu_items[index]
+            
+            if action_obj == "STOP":
+                self.stop_activity(dialog_id)
+                return
+            
+            # После выбора действия открываем меню выбора времени
+            run_on_ui_thread(lambda: self.show_duration_menu(activity, dialog_id, action_obj))
+
+        builder = AlertDialogBuilder(activity)
+        builder.set_title(self._get_str("WHAT_TO_DO"))
+        builder.set_items([m[0] for m in menu_items], on_action_chosen)
+        builder.show()
+
+    def show_duration_menu(self, activity: Any, dialog_id: int, action_obj: Any):
+        """Отображает диалог выбора длительности имитации."""
+        durations = [
+            (f"5 {self._get_str('SEC')}", 5),
+            (f"10 {self._get_str('SEC')}", 10),
+            (f"30 {self._get_str('SEC')}", 30),
+            (f"1 {self._get_str('MINUTES')}", 60),
+            (self._get_str("INFINITE"), -1)
+        ]
+
+        def on_time_chosen(bld, index):
+            bld.dismiss()
+            if index < 0 or index >= len(durations): return
+            _, seconds = durations[index]
+            self.start_activity_loop(dialog_id, action_obj, seconds)
+
+        builder = AlertDialogBuilder(activity)
+        builder.set_title(self._get_str("FOR_HOW_LONG"))
+        builder.set_items([d[0] for d in durations], on_time_chosen)
+        builder.show()
+
+    def start_activity_loop(self, dialog_id: int, action_obj: Any, seconds: int):
+        """Запускает фоновый поток для отправки пакетов активности."""
+        self.stop_activity(dialog_id)
+
+        stop_event = threading.Event()
+        with self._lock:
+            self._active_loops[dialog_id] = stop_event
+
+        # Пул действий для режима случайной активности
+        random_pool = [
+            TLRPC.TL_sendMessageTypingAction(),
+            TLRPC.TL_sendMessageRecordAudioAction(),
+            TLRPC.TL_sendMessageRecordVideoAction(),
+            TLRPC.TL_sendMessageUploadPhotoAction(),
+            TLRPC.TL_sendMessageUploadVideoAction(),
+            TLRPC.TL_sendMessageGamePlayAction()
+        ]
+
+        def loop_runner():
+            start_time = time.time()
+            current_action = action_obj
+            last_action_change = 0
+            
+            while not stop_event.is_set():
+                # Логика смены действия для режима RANDOM
+                if action_obj == "RANDOM":
+                    if time.time() - last_action_change > random.randint(5, 10):
+                        current_action = random.choice(random_pool)
+                        last_action_change = time.time()
+                
+                self._send_raw_request(dialog_id, current_action)
+                
+                # Проверка лимита времени
+                if seconds != -1 and time.time() - start_time >= seconds:
+                    break
+                
+                # Короткие интервалы сна для быстрой реакции на STOP
+                for _ in range(40):
+                    if stop_event.is_set():
+                        # Отправляем пакет отмены при ручной остановке
+                        self._send_raw_request(dialog_id, TLRPC.TL_sendMessageCancelAction())
+                        return
+                    time.sleep(0.1)
+            
+            # Завершение по времени или выходу из цикла
+            self._send_raw_request(dialog_id, TLRPC.TL_sendMessageCancelAction())
+            with self._lock:
+                if self._active_loops.get(dialog_id) == stop_event:
+                    self._active_loops.pop(dialog_id, None)
+            
+            # Уведомление об успешном завершении
+            if not stop_event.is_set():
+                 run_on_ui_thread(lambda: BulletinHelper.show_info(self._get_str("FINISHED")))
+
+        threading.Thread(target=loop_runner, daemon=True).start()
+        run_on_ui_thread(lambda: BulletinHelper.show_success(self._get_str("STARTED")))
+
+    def stop_activity(self, dialog_id: int):
+        """Останавливает имитацию в конкретном чате."""
+        with self._lock:
+            stop_event = self._active_loops.pop(dialog_id, None)
+            if stop_event:
+                stop_event.set()
+                self._send_raw_request(dialog_id, TLRPC.TL_sendMessageCancelAction())
+                run_on_ui_thread(lambda: BulletinHelper.show_info(self._get_str("STOPPED")))
+
+    def _send_raw_request(self, dialog_id: int, action: Any):
+        """Формирует и отправляет сетевой запрос к API Telegram."""
+        try:
+            peer = get_messages_controller().getInputPeer(dialog_id)
+            if not peer: return
+            req = TLRPC.TL_messages_setTyping()
+            req.peer = peer
+            req.action = action
+            send_request(req, None)
+        except Exception as e:
+            log(f"Activity Error: {e}")
+
+    def on_plugin_unload(self):
+        # Останавливаем все активные потоки при выключении плагина
+        with self._lock:
+            for dialog_id in list(self._active_loops.keys()):
+                stop_event = self._active_loops.pop(dialog_id, None)
+                if stop_event:
+                    stop_event.set()
