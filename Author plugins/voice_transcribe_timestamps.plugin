@@ -1,0 +1,215 @@
+import os
+import html
+import traceback
+
+import requests
+
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
+from ui.settings import Header, Input, Selector, Text
+from ui.bulletin import BulletinHelper
+from client_utils import send_message, run_on_queue, get_file_loader
+from android_utils import run_on_ui_thread
+
+__id__ = "voice_transcribe_timestamps"
+__name__ = "Транскрибация с таймкодами"
+__description__ = "Транскрибирует голосовые и видеосообщения через внешний Speech-to-Text API и присылает расшифровку с таймкодами."
+__author__ = "@oaxat"
+__version__ = "1.0.0"
+__icon__ = "shperma_konata/2"
+__min_version__ = "11.12.0"
+__requirements__ = ["requests"]
+
+DEFAULT_API_BASE = "https://api.openai.com/v1"
+DEFAULT_MODEL = "whisper-1"
+OUTPUT_FORMATS = ["Обычный текст", "Свёрнутая цитата", "Код-блок"]
+
+
+def format_timecode(seconds):
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return "%d:%02d:%02d" % (h, m, s)
+    return "%02d:%02d" % (m, s)
+
+
+class VoiceTranscribeTimestampsPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+            text="Транскрибировать с таймкодами",
+            icon="msg_voice_transcribe",
+            on_click=self._on_transcribe_click,
+        ))
+        self.log("voice_transcribe_timestamps loaded")
+
+    def create_settings(self):
+        return [
+            Header(text="Транскрибация с таймкодами"),
+            Input(
+                key="api_base",
+                text="Базовый URL API",
+                default=DEFAULT_API_BASE,
+                subtext="OpenAI-совместимый endpoint (OpenAI, Groq, свой сервер).",
+                icon="msg_link",
+            ),
+            Input(
+                key="api_key",
+                text="API-ключ",
+                default="",
+                subtext="Хранится в настройках плагина в открытом виде.",
+                icon="msg_pin_code",
+            ),
+            Input(
+                key="model",
+                text="Модель",
+                default=DEFAULT_MODEL,
+                subtext="Например: whisper-1, whisper-large-v3.",
+                icon="msg_bot",
+            ),
+            Input(
+                key="language",
+                text="Язык (ISO-код, необязательно)",
+                default="",
+                subtext="Пусто — автоопределение языка.",
+                icon="msg_translate",
+            ),
+            Selector(
+                key="output_format",
+                text="Формат вывода",
+                default=0,
+                items=OUTPUT_FORMATS,
+                icon="msg_format",
+            ),
+            Text(
+                text="Как использовать",
+                subtext="Долгий тап по голосовому/видеосообщению → «Транскрибировать с таймкодами». Сообщение должно быть уже скачано.",
+                icon="msg_info",
+            ),
+        ]
+
+    def _is_supported_message(self, context):
+        message = context.get("message") if context else None
+        if message is None:
+            return False
+        try:
+            return bool(message.isVoice() or message.isRoundVideo())
+        except Exception:
+            return False
+
+    def _on_transcribe_click(self, context):
+        try:
+            message = context.get("message")
+            if message is None:
+                return
+
+            if not self._is_supported_message(context):
+                BulletinHelper.show_info("Этот пункт работает только для голосовых и видеосообщений")
+                return
+
+            file_loader = get_file_loader()
+            java_file = file_loader.getPathToMessage(message.messageOwner)
+            if java_file is None or not java_file.exists():
+                BulletinHelper.show_info("Сначала откройте сообщение, чтобы оно скачалось")
+                return
+
+            file_path = str(java_file.getAbsolutePath())
+
+            api_base = (self.get_setting("api_base", DEFAULT_API_BASE) or DEFAULT_API_BASE).rstrip("/")
+            api_key = self.get_setting("api_key", "")
+            model = self.get_setting("model", DEFAULT_MODEL) or DEFAULT_MODEL
+            language = (self.get_setting("language", "") or "").strip()
+
+            if not api_key:
+                BulletinHelper.show_error("Укажите API-ключ в настройках плагина")
+                return
+
+            run_on_queue(lambda: self._transcribe(message, file_path, api_base, api_key, model, language))
+        except Exception:
+            self.log("transcribe click error: %s" % traceback.format_exc())
+            BulletinHelper.show_error("Не удалось начать транскрибацию")
+
+    def _transcribe(self, message, file_path, api_base, api_key, model, language):
+        try:
+            with open(file_path, "rb") as f:
+                data = {
+                    "model": model,
+                    "response_format": "verbose_json",
+                    "timestamp_granularities[]": "segment",
+                }
+                if language:
+                    data["language"] = language
+
+                resp = requests.post(
+                    "%s/audio/transcriptions" % api_base,
+                    headers={"Authorization": "Bearer %s" % api_key},
+                    files={"file": (os.path.basename(file_path), f)},
+                    data=data,
+                    timeout=120,
+                )
+
+            if resp.status_code != 200:
+                error_text = resp.text[:300] if resp.text else str(resp.status_code)
+                run_on_ui_thread(lambda: BulletinHelper.show_error("Ошибка API (%s): %s" % (resp.status_code, error_text)))
+                return
+
+            payload = resp.json()
+            segments = payload.get("segments") or []
+            output_format = int(self.get_setting("output_format", 0) or 0)
+
+            if not segments:
+                text = (payload.get("text") or "").strip()
+                if not text:
+                    run_on_ui_thread(lambda: BulletinHelper.show_error("Пустой результат транскрибации"))
+                    return
+                plain_lines = [text]
+            else:
+                plain_lines = []
+                for segment in segments:
+                    start = segment.get("start", 0)
+                    text = (segment.get("text") or "").strip()
+                    if not text:
+                        continue
+                    plain_lines.append("[%s] %s" % (format_timecode(start), text))
+
+            if not plain_lines:
+                run_on_ui_thread(lambda: BulletinHelper.show_error("Пустой результат транскрибации"))
+                return
+
+            formatted = self._format_output(plain_lines, output_format)
+
+            run_on_ui_thread(lambda: self._send_reply(message, formatted))
+        except requests.RequestException as e:
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Сетевая ошибка: %s" % str(e)))
+        except Exception:
+            self.log("transcribe error: %s" % traceback.format_exc())
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось транскрибировать сообщение"))
+
+    def _format_output(self, plain_lines, output_format):
+        if output_format == 2:
+            escaped = "\n".join(html.escape(line) for line in plain_lines)
+            return "<pre>%s</pre>" % escaped
+
+        escaped_bold_lines = []
+        for line in plain_lines:
+            if line.startswith("[") and "]" in line:
+                timecode, rest = line.split("]", 1)
+                escaped_bold_lines.append("<b>%s]</b>%s" % (html.escape(timecode), html.escape(rest)))
+            else:
+                escaped_bold_lines.append(html.escape(line))
+        body = "\n".join(escaped_bold_lines)
+
+        if output_format == 1:
+            return "<blockquote expandable>%s</blockquote>" % body
+        return body
+
+    def _send_reply(self, message, formatted_text):
+        try:
+            send_message({
+                "peer": message.messageOwner.peer_id,
+                "message": formatted_text,
+                "replyToMsg": message,
+            }, parse_mode="HTML")
+        except Exception:
+            self.log("send reply error: %s" % traceback.format_exc())
+            BulletinHelper.show_error("Не удалось отправить расшифровку")

@@ -1,0 +1,348 @@
+import os
+import re
+import json
+import threading
+import traceback
+import urllib.request
+import urllib.parse
+
+from base_plugin import BasePlugin
+from ui.settings import Header, Text, Input, Divider
+from ui.bulletin import BulletinHelper
+from android_utils import run_on_ui_thread
+from client_utils import get_last_fragment
+
+from java import dynamic_proxy, jclass
+from org.telegram.messenger import ApplicationLoader, Utilities
+from com.exteragram.messenger.plugins import PluginsController, PluginsConstants
+
+try:
+    from ui.alert import AlertDialogBuilder
+except Exception:
+    AlertDialogBuilder = None
+
+__id__ = "plugin_marketplace"
+__name__ = "Маркетплейс плагинов"
+__description__ = "Просматривает и устанавливает плагины из GitHub-репозитория прямо из настроек."
+__author__ = "@meowgram"
+__version__ = "1.0.0"
+__icon__ = "shperma_konata/2"
+__min_version__ = "11.12.0"
+__requirements__ = []
+
+# Репозиторий по умолчанию в формате owner/repo.
+DEFAULT_REPO = "meowgramteam/plugins-repository"
+DEFAULT_BRANCH = "main"
+
+# Папки внутри репозитория (как они названы в meowgramteam/plugins-repository).
+AUTHOR_DIR = "Author plugins"
+COMMUNITY_DIR = "other plugins"
+
+HTTP_TIMEOUT = 30
+
+# Парсинг dunder-метаданных из тела .plugin файла.
+_META_RE = re.compile(r"^__(\w+)__\s*=\s*(.+)$", re.MULTILINE)
+
+
+class PluginMarketplacePlugin(BasePlugin):
+    def on_plugin_load(self):
+        # Кэш каталога в памяти.
+        self._author_catalog = []    # авторские плагины (папка AUTHOR_DIR)
+        self._catalog = []           # плагины сообщества (папка COMMUNITY_DIR)
+        # None = ещё не грузили, "loading", "ok", "error: ..."
+        self._state = None
+        self.log("plugin_marketplace loaded")
+
+    # ------------------------------------------------------------------ settings
+
+    def create_settings(self):
+        items = [
+            Header(text="Маркетплейс плагинов"),
+            Input(
+                key="repo",
+                text="Репозиторий",
+                default=DEFAULT_REPO,
+                subtext="GitHub в формате owner/repo",
+                icon="msg_link",
+            ),
+            Input(
+                key="branch",
+                text="Ветка",
+                default=DEFAULT_BRANCH,
+                icon="msg_media",
+            ),
+            Text(
+                text="Обновить список",
+                subtext="Загрузить каталог из репозитория",
+                icon="msg_retry",
+                accent=True,
+                on_click=lambda ctx: self._refresh(force=True),
+            ),
+            Divider(),
+        ]
+
+        state = self._state
+        if state == "loading":
+            items.append(Text(text="Загрузка…", icon="msg_download"))
+        elif isinstance(state, str) and state.startswith("error:"):
+            items.append(Text(text="Ошибка загрузки", subtext=state[len("error:"):].strip(), icon="msg_info", red=True))
+        elif not self._author_catalog and not self._catalog:
+            items.append(Text(
+                text="Каталог пуст",
+                subtext="Нажмите «Обновить список», чтобы загрузить плагины",
+                icon="msg_info",
+            ))
+
+        if self._author_catalog:
+            items.append(Header(text="Авторские плагины"))
+            for entry in self._author_catalog:
+                items.append(self._catalog_row(entry))
+
+        if self._catalog:
+            items.append(Header(text="Плагины сообщества"))
+            for entry in self._catalog:
+                items.append(self._catalog_row(entry))
+
+        # Ленивая первичная загрузка при первом открытии настроек.
+        if state is None:
+            self._refresh(force=False)
+
+        return items
+
+    def _catalog_row(self, entry):
+        name = entry.get("name") or entry.get("id") or "Без названия"
+        version = entry.get("version")
+        author = entry.get("author")
+        installed_ver = self._installed_version(entry.get("id"))
+
+        subtext_parts = []
+        if entry.get("description"):
+            subtext_parts.append(entry["description"])
+        meta = []
+        if author:
+            meta.append(str(author))
+        if version:
+            meta.append("v%s" % version)
+        if installed_ver is not None:
+            if version and str(installed_ver) == str(version):
+                meta.append("✓ установлен")
+            else:
+                meta.append("↑ обновление")
+        if meta:
+            subtext_parts.append(" · ".join(meta))
+
+        return Text(
+            text=name,
+            subtext="\n".join(subtext_parts) if subtext_parts else None,
+            icon=entry.get("icon") or "msg_customize",
+            on_click=lambda ctx, e=entry: self._show_entry_dialog(e),
+        )
+
+    # ------------------------------------------------------------------ helpers
+
+    def _installed_version(self, plugin_id):
+        """Возвращает версию установленного плагина или None, если не установлен."""
+        if not plugin_id:
+            return None
+        try:
+            plugin = PluginsController.getInstance().plugins.get(plugin_id)
+            if plugin is None:
+                return None
+            for attr in ("version", "getVersion"):
+                try:
+                    val = getattr(plugin, attr)
+                    val = val() if callable(val) else val
+                    if val:
+                        return str(val)
+                except Exception:
+                    pass
+            return ""  # установлен, версия неизвестна
+        except Exception:
+            return None
+
+    def _repo(self):
+        return (self.get_setting("repo", DEFAULT_REPO) or DEFAULT_REPO).strip().strip("/")
+
+    def _branch(self):
+        return (self.get_setting("branch", DEFAULT_BRANCH) or DEFAULT_BRANCH).strip()
+
+    def _reload_ui(self):
+        # Перерисовать экран настроек (set_setting с reload_settings=True).
+        try:
+            self.set_setting("_tick", (self.get_setting("_tick", 0) or 0) + 1, reload_settings=True)
+        except Exception:
+            self.log("reload ui error: %s" % traceback.format_exc())
+
+    def _http_get(self, url, as_json=False):
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "exteraGram-marketplace",
+            "Accept": "application/vnd.github+json" if as_json else "*/*",
+        })
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            raw = resp.read()
+        return json.loads(raw.decode("utf-8")) if as_json else raw
+
+    # ------------------------------------------------------------------ catalog fetch
+
+    def _refresh(self, force=False):
+        if self._state == "loading":
+            return
+        if not force and (self._author_catalog or self._catalog):
+            return
+        self._state = "loading"
+        if force:
+            self._reload_ui()
+        threading.Thread(target=self._fetch_thread, daemon=True).start()
+
+    def _fetch_thread(self):
+        repo = self._repo()
+        branch = self._branch()
+        try:
+            if "/" not in repo:
+                raise Exception("Укажите репозиторий как owner/repo")
+            author = self._scan_dir(repo, branch, AUTHOR_DIR)
+            community = self._scan_dir(repo, branch, COMMUNITY_DIR)
+            self._author_catalog = author
+            self._catalog = community
+            self._state = "ok"
+        except Exception as e:
+            self._state = "error: %s" % (str(e) or e.__class__.__name__)
+            self.log("catalog fetch error: %s" % traceback.format_exc())
+        run_on_ui_thread(self._reload_ui)
+
+    def _scan_dir(self, repo, branch, directory):
+        """Читает список .plugin файлов в папке репозитория через GitHub API."""
+        api_url = "https://api.github.com/repos/%s/contents/%s?ref=%s" % (
+            repo, urllib.parse.quote(directory), urllib.parse.quote(branch))
+        try:
+            listing = self._http_get(api_url, as_json=True)
+        except Exception as e:
+            # Папки может не быть — не критично.
+            self.log("scan %s error: %s" % (directory, e))
+            return []
+        if not isinstance(listing, list):
+            return []
+
+        entries = []
+        for item in listing:
+            if item.get("type") != "file":
+                continue
+            fname = item.get("name") or ""
+            if not fname.endswith(".plugin"):
+                continue
+            download_url = item.get("download_url")
+            if not download_url:
+                continue
+            entry = {"download_url": download_url, "id": fname[:-len(".plugin")]}
+            try:
+                self._enrich_meta(entry, download_url)
+            except Exception:
+                self.log("meta parse error for %s: %s" % (fname, traceback.format_exc()))
+            entries.append(entry)
+        return entries
+
+    def _enrich_meta(self, entry, download_url):
+        """Скачивает .plugin и вытаскивает dunder-метаданные в entry."""
+        raw = self._http_get(download_url).decode("utf-8", errors="replace")
+        # Достаточно заголовка файла.
+        head = raw[:4000]
+        for key, val in _META_RE.findall(head):
+            val = val.strip()
+            # Снять кавычки, если строковый литерал.
+            if len(val) >= 2 and val[0] in "\"'" and val[-1] == val[0]:
+                val = val[1:-1]
+            if key in ("id", "name", "description", "author", "version", "icon"):
+                entry[key] = val
+
+    # ------------------------------------------------------------------ install
+
+    def _show_entry_dialog(self, entry):
+        name = entry.get("name") or entry.get("id") or "плагин"
+        installed = self._installed_version(entry.get("id")) is not None
+        action = "Обновить" if installed else "Установить"
+
+        lines = []
+        if entry.get("description"):
+            lines.append(entry["description"])
+        if entry.get("author"):
+            lines.append("Автор: %s" % entry["author"])
+        if entry.get("version"):
+            lines.append("Версия: %s" % entry["version"])
+        message = "\n".join(lines) if lines else "Установить этот плагин?"
+
+        fragment = get_last_fragment()
+        if AlertDialogBuilder is None or fragment is None or getattr(fragment, "getParentActivity", None) is None:
+            self._install(entry)
+            return
+
+        activity = fragment.getParentActivity()
+        if activity is None:
+            self._install(entry)
+            return
+
+        try:
+            builder = AlertDialogBuilder(activity)
+            builder.set_title(name)
+            builder.set_message(message)
+            def on_ok(d, w):
+                d.dismiss()
+                self._install(entry)
+            builder.set_positive_button(action, on_ok)
+            builder.set_negative_button("Отмена", lambda d, w: d.dismiss())
+            builder.show()
+        except Exception:
+            self.log("dialog error: %s" % traceback.format_exc())
+            self._install(entry)
+
+    def _install(self, entry):
+        BulletinHelper.show_info("Загрузка «%s»…" % (entry.get("name") or entry.get("id")))
+        threading.Thread(target=lambda: self._install_thread(entry), daemon=True).start()
+
+    def _install_thread(self, entry):
+        temp_file = None
+        try:
+            content = self._http_get(entry.get("download_url"))
+
+            plugins_dir = os.path.join(str(ApplicationLoader.applicationContext.getFilesDir()), "plugins")
+            os.makedirs(plugins_dir, exist_ok=True)
+            safe_id = (entry.get("id") or "plugin").replace("/", "_")
+            temp_file = os.path.join(plugins_dir, "%s_install.tmp" % safe_id)
+            with open(temp_file, "wb") as f:
+                f.write(content)
+
+            self._load_plugin_file(temp_file)
+        except Exception as e:
+            if temp_file:
+                try:
+                    os.remove(temp_file)
+                except Exception:
+                    pass
+            self.log("install error: %s" % traceback.format_exc())
+            run_on_ui_thread(lambda: BulletinHelper.show_error(
+                "Не удалось установить: %s" % (str(e) or e.__class__.__name__)))
+
+    def _load_plugin_file(self, temp_file):
+        plugin_self = self
+
+        class Callback(dynamic_proxy(Utilities.Callback)):
+            def run(self, error):
+                try:
+                    os.remove(temp_file)
+                except Exception:
+                    pass
+                if error:
+                    run_on_ui_thread(lambda: BulletinHelper.show_error("Ошибка загрузки плагина: %s" % error))
+                else:
+                    run_on_ui_thread(lambda: BulletinHelper.show_success("Плагин установлен"))
+                    run_on_ui_thread(plugin_self._reload_ui)
+
+        class LoadRunnable(dynamic_proxy(jclass("java.lang.Runnable"))):
+            def run(self):
+                try:
+                    engine = PluginsController.getInstance().engines.get(PluginsConstants.PYTHON)
+                    engine.loadPluginFromFile(temp_file, None, Callback())
+                except Exception:
+                    plugin_self.log("loadPluginFromFile error: %s" % traceback.format_exc())
+                    run_on_ui_thread(lambda: BulletinHelper.show_error("Движок плагинов недоступен"))
+
+        Utilities.pluginsQueue.postRunnable(LoadRunnable())

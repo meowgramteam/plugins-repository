@@ -1,0 +1,132 @@
+import base64
+import traceback
+
+from base_plugin import BasePlugin, HookResult, HookStrategy, MenuItemData, MenuItemType
+from ui.settings import Header, Text
+from ui.bulletin import BulletinHelper
+from client_utils import send_text
+
+__id__ = "base64_encoder"
+__name__ = "Base64 кодировщик"
+__description__ = "Команда .b64 текст кодирует текст в Base64 перед отправкой."
+__author__ = "@oaxat"
+__version__ = "1.0.0"
+__icon__ = "shperma_konata/2"
+__min_version__ = "11.12.0"
+__requirements__ = []
+
+
+class Base64EncoderPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.add_on_send_message_hook()
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+            text="Декодировать Base64",
+            icon="msg_copy",
+            on_click=self._on_decode_click,
+        ))
+        self.log("base64_encoder loaded")
+
+    def create_settings(self):
+        return [
+            Header(text="Base64 кодировщик"),
+            Text(
+                text="Как использовать",
+                subtext=".b64 текст -> кодирует в Base64\n.unb64 текст -> декодирует из Base64\nДолгий тап по сообщению -> «Декодировать Base64»",
+                icon="msg_info",
+            ),
+        ]
+
+    def _on_decode_click(self, context):
+        try:
+            message = context.get("message") if context else None
+            if message is None:
+                return
+
+            raw_text = self._extract_message_text(message)
+            if not raw_text:
+                BulletinHelper.show_error("В сообщении нет текста")
+                return
+
+            try:
+                decoded = base64.b64decode(raw_text, validate=True).decode("utf-8")
+            except Exception:
+                BulletinHelper.show_error("Это не похоже на корректную строку Base64")
+                return
+
+            peer_id = self._extract_peer_id(message, context)
+            if peer_id is None:
+                BulletinHelper.show_error("Не удалось определить чат для ответа")
+                return
+
+            send_text(peer_id, decoded, replyToMsg=message)
+        except Exception:
+            err = traceback.format_exc()
+            self.log("decode click error: %s" % err)
+            BulletinHelper.show_error("Не удалось декодировать сообщение: %s" % err.strip().splitlines()[-1][:150])
+
+    def _extract_message_text(self, message):
+        for attr in ("messageText",):
+            try:
+                value = getattr(message, attr, None)
+                if value:
+                    return str(value).strip()
+            except Exception:
+                pass
+        try:
+            value = message.messageOwner.message
+            if value:
+                return str(value).strip()
+        except Exception:
+            pass
+        return ""
+
+    def _extract_peer_id(self, message, context):
+        if context:
+            for key in ("dialog_id", "dialogId"):
+                value = context.get(key)
+                if value:
+                    return value
+        try:
+            return message.getDialogId()
+        except Exception:
+            pass
+        try:
+            return message.messageOwner.dialog_id
+        except Exception:
+            pass
+        return None
+
+    def on_send_message_hook(self, account, params):
+        message = getattr(params, "message", None)
+        if not isinstance(message, str):
+            return HookResult()
+
+        raw_text = message.strip()
+
+        try:
+            if raw_text.startswith(".b64"):
+                payload = raw_text[len(".b64"):].strip()
+                if not payload:
+                    params.message = "Использование: .b64 <текст>"
+                    return HookResult(strategy=HookStrategy.MODIFY, params=params)
+                encoded = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+                params.message = encoded
+                return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+            if raw_text.startswith(".unb64"):
+                payload = raw_text[len(".unb64"):].strip()
+                if not payload:
+                    params.message = "Использование: .unb64 <base64>"
+                    return HookResult(strategy=HookStrategy.MODIFY, params=params)
+                try:
+                    decoded = base64.b64decode(payload, validate=True).decode("utf-8")
+                except Exception:
+                    params.message = "Не удалось декодировать: некорректная строка Base64"
+                    return HookResult(strategy=HookStrategy.MODIFY, params=params)
+                params.message = decoded
+                return HookResult(strategy=HookStrategy.MODIFY, params=params)
+        except Exception:
+            self.log("base64 hook error: %s" % traceback.format_exc())
+
+        return HookResult()

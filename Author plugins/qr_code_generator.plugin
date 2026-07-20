@@ -1,0 +1,68 @@
+import os
+import uuid
+import traceback
+
+import qrcode
+
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from ui.settings import Header, Text
+from ui.bulletin import BulletinHelper
+from client_utils import send_photo, run_on_queue
+from file_utils import get_cache_dir
+from android_utils import run_on_ui_thread
+
+__id__ = "qr_code_generator"
+__name__ = "QR-код генератор"
+__description__ = "Команда .qr текст создаёт и отправляет QR-код как изображение."
+__author__ = "@oaxat"
+__version__ = "1.0.0"
+__icon__ = "shperma_konata/2"
+__min_version__ = "11.12.0"
+__requirements__ = ["qrcode"]
+
+
+class QrCodeGeneratorPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.add_on_send_message_hook()
+        self.log("qr_code_generator loaded")
+
+    def create_settings(self):
+        return [
+            Header(text="QR-код генератор"),
+            Text(
+                text="Как использовать",
+                subtext=".qr текст -> отправляет QR-код с этим текстом вместо сообщения",
+                icon="msg_info",
+            ),
+        ]
+
+    def on_send_message_hook(self, account, params):
+        message = getattr(params, "message", None)
+        if not isinstance(message, str):
+            return HookResult()
+
+        raw_text = message.strip()
+        if not raw_text.startswith(".qr"):
+            return HookResult()
+
+        parts = raw_text.split(" ", 1)
+        payload = parts[1].strip() if len(parts) > 1 else ""
+
+        if not payload:
+            params.message = "Использование: .qr <текст>"
+            return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+        peer = params.peer
+        run_on_queue(lambda: self._generate_and_send(peer, payload))
+        return HookResult(strategy=HookStrategy.CANCEL)
+
+    def _generate_and_send(self, peer, payload):
+        file_path = None
+        try:
+            img = qrcode.make(payload)
+            file_path = os.path.join(get_cache_dir(), "qr_%s.png" % uuid.uuid4().hex)
+            img.save(file_path)
+            run_on_ui_thread(lambda: send_photo(peer, file_path))
+        except Exception:
+            self.log("qr generation error: %s" % traceback.format_exc())
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось сгенерировать QR-код"))

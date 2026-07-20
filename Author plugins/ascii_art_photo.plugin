@@ -1,0 +1,149 @@
+import os
+import html
+import traceback
+
+from PIL import Image, ImageOps
+
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
+from ui.settings import Header, Input, Switch, Selector, Text
+from ui.bulletin import BulletinHelper
+from client_utils import send_text, run_on_queue, get_file_loader
+from android_utils import run_on_ui_thread
+
+__id__ = "ascii_art_photo"
+__name__ = "ASCII-арт из фото"
+__description__ = "Конвертирует присланное фото в ASCII-арт и отправляет как текстовый code-block."
+__author__ = "@oaxat"
+__version__ = "1.0.0"
+__icon__ = "shperma_konata/2"
+__min_version__ = "11.12.0"
+__requirements__ = []
+
+RAMP = "$@B%8&WM#*oahkbdpqwmZO0QLCJUYXzcvunxrjft/\\|()1{}[]?-_+~<>i!lI;:,\"^`'. "
+TELEGRAM_MESSAGE_LIMIT = 4096
+DEFAULT_WIDTH = 100
+CHAR_ASPECT = 0.5
+OUTPUT_FORMATS = ["Код-блок", "Свёрнутая цитата", "Обычный текст"]
+
+
+class AsciiArtPhotoPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+            text="ASCII-арт",
+            icon="msg_photo_ascii",
+            on_click=self._on_ascii_click,
+        ))
+        self.log("ascii_art_photo loaded")
+
+    def create_settings(self):
+        return [
+            Header(text="ASCII-арт из фото"),
+            Input(
+                key="width",
+                text="Ширина в символах",
+                default=str(DEFAULT_WIDTH),
+                subtext="20-200. Больше ширина -> детальнее, но длиннее сообщение.",
+                icon="msg_edit",
+            ),
+            Switch(
+                key="invert",
+                text="Инвертировать яркость",
+                default=False,
+                subtext="Включите, если результат выглядит негативом.",
+            ),
+            Selector(
+                key="output_format",
+                text="Формат вывода",
+                default=0,
+                items=OUTPUT_FORMATS,
+                icon="msg_format",
+            ),
+            Text(
+                text="Как использовать",
+                subtext="Долгий тап по фото -> «ASCII-арт»",
+                icon="msg_info",
+            ),
+        ]
+
+    def _is_photo_message(self, context):
+        message = context.get("message") if context else None
+        if message is None:
+            return False
+        try:
+            return bool(message.isPhoto())
+        except Exception:
+            return False
+
+    def _on_ascii_click(self, context):
+        try:
+            message = context.get("message")
+            if message is None:
+                return
+
+            if not self._is_photo_message(context):
+                BulletinHelper.show_info("Этот пункт работает только для фото")
+                return
+
+            file_loader = get_file_loader()
+            java_file = file_loader.getPathToMessage(message.messageOwner)
+            if java_file is None or not java_file.exists():
+                BulletinHelper.show_info("Сначала откройте фото, чтобы оно скачалось")
+                return
+
+            file_path = str(java_file.getAbsolutePath())
+
+            try:
+                width = int(self.get_setting("width", str(DEFAULT_WIDTH)))
+            except (TypeError, ValueError):
+                width = DEFAULT_WIDTH
+            width = max(20, min(200, width))
+            invert = bool(self.get_setting("invert", False))
+
+            run_on_queue(lambda: self._convert_and_send(message, file_path, width, invert))
+        except Exception:
+            self.log("ascii click error: %s" % traceback.format_exc())
+            BulletinHelper.show_error("Не удалось начать конвертацию")
+
+    def _convert_and_send(self, message, file_path, width, invert):
+        try:
+            img = Image.open(file_path).convert("L")
+            img = ImageOps.autocontrast(img, cutoff=1)
+            img_w, img_h = img.size
+            height = max(1, int(width * (img_h / img_w) * CHAR_ASPECT))
+
+            total_chars = width * height + height
+            if total_chars > TELEGRAM_MESSAGE_LIMIT - 20:
+                scale = ((TELEGRAM_MESSAGE_LIMIT - 20) / float(total_chars)) ** 0.5
+                width = max(20, int(width * scale))
+                height = max(1, int(width * (img_h / img_w) * CHAR_ASPECT))
+
+            img = img.resize((width, height), Image.LANCZOS)
+            pixels = img.getdata()
+
+            ramp = RAMP[::-1] if invert else RAMP
+            ramp_len = len(ramp) - 1
+
+            lines = []
+            for row in range(height):
+                row_chars = []
+                for col in range(width):
+                    value = pixels[row * width + col]
+                    row_chars.append(ramp[int(value / 255 * ramp_len)])
+                lines.append("".join(row_chars))
+
+            ascii_art = "\n".join(lines)
+            output_format = int(self.get_setting("output_format", 0) or 0)
+            escaped = html.escape(ascii_art)
+            if output_format == 1:
+                formatted = "<blockquote expandable>%s</blockquote>" % escaped
+            elif output_format == 2:
+                formatted = escaped
+            else:
+                formatted = "<pre>%s</pre>" % escaped
+
+            peer_id = message.getDialogId()
+            run_on_ui_thread(lambda: send_text(peer_id, formatted, replyToMsg=message, parse_mode="HTML"))
+        except Exception:
+            self.log("ascii conversion error: %s" % traceback.format_exc())
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось сконвертировать фото в ASCII"))
